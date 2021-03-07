@@ -16,7 +16,8 @@ futures = "0.3"
 cgmath = "0.17"
 wgpu = "0.7"
 bytemuck = { version = "1.4", features = [ "derive" ] }
-# shaderc = "0.7"
+anyhow = "1.0"
+
 
 # [dependencies.wgpu]
 # version = "0.7"
