@@ -1,9 +1,51 @@
 use futures::executor::block_on;
+use wgpu::util::DeviceExt;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [0.0, 0.5, 0.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.0],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.0],
+        color: [0.0, 0.0, 1.0],
+    },
+];
+impl Vertex {
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::InputStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float3,
+                },
+            ],
+        }
+    }
+}
 
 struct State {
     surface: wgpu::Surface,
@@ -14,8 +56,10 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     clear_color: wgpu::Color,
     mouse_in_window: bool,
-    render_pipelines: [wgpu::RenderPipeline; 2],
+    render_pipelines: [wgpu::RenderPipeline; 1],
     current_pipeline_index: usize,
+    vertex_buffer: wgpu::Buffer,
+    num_vertices: u32,
 }
 
 impl State {
@@ -58,8 +102,8 @@ impl State {
         let swap_chain = device.create_swap_chain(&surface, &sc_desc);
 
         let render_pipeline_1 = {
-            let vs_module = device.create_shader_module(&wgpu::include_spirv!("shader_1.vert.spv"));
-            let fs_module = device.create_shader_module(&wgpu::include_spirv!("shader_1.frag.spv"));
+            let vs_module = device.create_shader_module(&wgpu::include_spirv!("shader.vert.spv"));
+            let fs_module = device.create_shader_module(&wgpu::include_spirv!("shader.frag.spv"));
 
             let render_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -73,8 +117,8 @@ impl State {
                 layout: Some(&render_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &vs_module,
-                    entry_point: "main", // 1.
-                    buffers: &[],        // 2.
+                    entry_point: "main",
+                    buffers: &[Vertex::desc()],
                 },
                 fragment: Some(wgpu::FragmentState {
                     // 3.
@@ -89,9 +133,9 @@ impl State {
                     }],
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                    topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw, // 2.
+                    front_face: wgpu::FrontFace::Ccw,
                     cull_mode: wgpu::CullMode::Back,
                     // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                     polygon_mode: wgpu::PolygonMode::Fill,
@@ -105,54 +149,12 @@ impl State {
             })
         };
 
-        let render_pipeline_2 = {
-            let vs_module = device.create_shader_module(&wgpu::include_spirv!("shader_2.vert.spv"));
-            let fs_module = device.create_shader_module(&wgpu::include_spirv!("shader_2.frag.spv"));
-
-            let render_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[],
-                    push_constant_ranges: &[],
-                });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &vs_module,
-                    entry_point: "main", // 1.
-                    buffers: &[],        // 2.
-                },
-                fragment: Some(wgpu::FragmentState {
-                    // 3.
-                    module: &fs_module,
-                    entry_point: "main",
-                    targets: &[wgpu::ColorTargetState {
-                        // 4.
-                        format: sc_desc.format,
-                        alpha_blend: wgpu::BlendState::REPLACE,
-                        color_blend: wgpu::BlendState::REPLACE,
-                        write_mask: wgpu::ColorWrite::ALL,
-                    }],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList, // 1.
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw, // 2.
-                    cull_mode: wgpu::CullMode::Back,
-                    // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                },
-                depth_stencil: None, // 1.
-                multisample: wgpu::MultisampleState {
-                    count: 1,                         // 2.
-                    mask: !0,                         // 3.
-                    alpha_to_coverage_enabled: false, // 4.
-                },
-            })
-        };
-
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsage::VERTEX,
+        });
+        let num_vertices = VERTICES.len() as u32;
         Self {
             surface,
             device,
@@ -160,7 +162,7 @@ impl State {
             sc_desc,
             swap_chain,
             size,
-            render_pipelines: [render_pipeline_1, render_pipeline_2],
+            render_pipelines: [render_pipeline_1],
             clear_color: wgpu::Color {
                 r: 0.1,
                 g: 0.2,
@@ -169,6 +171,8 @@ impl State {
             },
             mouse_in_window: false,
             current_pipeline_index: 0,
+            vertex_buffer,
+            num_vertices,
         }
     }
 
@@ -244,8 +248,9 @@ impl State {
                 }],
                 depth_stencil_attachment: None,
             });
-            render_pass.set_pipeline(&self.render_pipelines[self.current_pipeline_index]); // 2.
-            render_pass.draw(0..3, 0..1);
+            render_pass.set_pipeline(&self.render_pipelines[self.current_pipeline_index]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.draw(0..self.num_vertices, 0..1);
         }
 
         // submit will accept anything that implements IntoIter
