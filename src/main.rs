@@ -110,6 +110,7 @@ struct State {
     num_indices: u32,
     diffuse_bind_groups: [wgpu::BindGroup; 2],
     current_diffuse_bind_group: usize,
+    depth_bind_group: wgpu::BindGroup,
     diffuse_texture: Texture,
     uniforms: Uniforms,
     uniform_buffer: wgpu::Buffer,
@@ -118,6 +119,7 @@ struct State {
     camera_controller: CameraController,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
+    depth_texture: Texture,
 }
 
 impl State {
@@ -185,6 +187,32 @@ impl State {
                 label: Some("texture_bind_group_layout"),
             });
 
+        let depth_texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStage::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStage::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler {
+                            comparison: true,
+                            filtering: true,
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("texture_bind_group_layout"),
+            });
+
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -207,7 +235,11 @@ impl State {
             let render_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
+                    bind_group_layouts: &[
+                        &texture_bind_group_layout,
+                        &uniform_bind_group_layout,
+                        &depth_texture_bind_group_layout,
+                    ],
                     push_constant_ranges: &[],
                 });
 
@@ -239,7 +271,15 @@ impl State {
                     // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                     polygon_mode: wgpu::PolygonMode::Fill,
                 },
-                depth_stencil: None, // 1.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Texture::DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                    // Setting this to true requires Features::DEPTH_CLAMPING
+                    clamp_depth: false,
+                }),
                 multisample: wgpu::MultisampleState {
                     count: 1,                         // 2.
                     mask: !0,                         // 3.
@@ -247,6 +287,22 @@ impl State {
                 },
             })
         };
+        let depth_texture = Texture::create_depth_texture(&device, &sc_desc, "depth_texture");
+
+        let depth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &depth_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&depth_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&depth_texture.sampler),
+                },
+            ],
+            label: Some("depth_bind_group"),
+        });
 
         let diffuse_texture_1 = Texture::from_bytes(
             &device,
@@ -403,6 +459,8 @@ impl State {
             camera_controller,
             instances,
             instance_buffer,
+            depth_texture,
+            depth_bind_group,
         }
     }
 
@@ -411,6 +469,8 @@ impl State {
         self.sc_desc.width = new_size.width;
         self.sc_desc.height = new_size.height;
         self.swap_chain = self.device.create_swap_chain(&self.surface, &self.sc_desc);
+        self.depth_texture =
+            texture::Texture::create_depth_texture(&self.device, &self.sc_desc, "depth_texture");
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
@@ -503,7 +563,14 @@ impl State {
                         store: true,
                     },
                 }],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachmentDescriptor {
+                    attachment: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: true,
+                    }),
+                    stencil_ops: None,
+                }),
             });
             render_pass.set_pipeline(&self.render_pipelines[self.current_pipeline_index]);
 
@@ -513,6 +580,7 @@ impl State {
                 &[],
             );
             render_pass.set_bind_group(1, &self.uniform_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.depth_bind_group, &[]);
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
