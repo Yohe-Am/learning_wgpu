@@ -84,7 +84,6 @@ struct Uniforms {
 
 impl Uniforms {
     fn new() -> Self {
-        use cgmath::SquareMatrix;
         Self {
             view_proj: cgmath::Matrix4::identity().into(),
         }
@@ -372,7 +371,7 @@ impl State {
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Instance Buffer"),
             contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsage::VERTEX,
+            usage: wgpu::BufferUsage::VERTEX | wgpu::BufferUsage::COPY_DST,
         });
 
         Self {
@@ -469,6 +468,21 @@ impl State {
             0,
             bytemuck::cast_slice(&[self.uniforms]),
         );
+        for instance in &mut self.instances {
+            instance.rotation = instance.rotation
+                * cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_y(), cgmath::Deg(1.0));
+        }
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(
+                &self
+                    .instances
+                    .iter()
+                    .map(Instance::to_raw)
+                    .collect::<Vec<_>>(),
+            ),
+        )
     }
 
     fn render(&mut self) -> Result<(), wgpu::SwapChainError> {
