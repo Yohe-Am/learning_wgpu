@@ -62,8 +62,11 @@ fn main() -> Result<()> {
     // recently.
     for shader in shaders {
         // This tells cargo to rerun this script if something in /src/ changes.
-        println!("cargo:rerun-if-changed={}", shader.src_path.as_os_str().to_str().unwrap());
-        
+        println!(
+            "cargo:rerun-if-changed={}",
+            shader.src_path.as_os_str().to_str().unwrap()
+        );
+
         let compiled = compiler.compile_into_spirv(
             &shader.src,
             shader.kind,
@@ -73,10 +76,14 @@ fn main() -> Result<()> {
         )?;
         write(shader.spv_path, compiled.as_binary_u8())?;
     }
+    println!("cargo:rerun-if-changed=res/*");
+
+    let out_dir = std::env::var("OUT_DIR")?;
+    let mut copy_options = fs_extra::dir::CopyOptions::new();
+    copy_options.overwrite = true;
+    let mut paths_to_copy = Vec::new();
+    paths_to_copy.push("res/");
+    fs_extra::copy_items(&paths_to_copy, out_dir, &copy_options)?;
 
     Ok(())
 }
-
- 
-
- 

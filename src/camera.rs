@@ -63,11 +63,11 @@ impl CameraController {
             } => {
                 let is_pressed = *state == ElementState::Pressed;
                 match keycode {
-                    VirtualKeyCode::Space => {
+                    VirtualKeyCode::F => {
                         self.is_up_pressed = is_pressed;
                         true
                     }
-                    VirtualKeyCode::LShift => {
+                    VirtualKeyCode::C => {
                         self.is_down_pressed = is_pressed;
                         true
                     }
