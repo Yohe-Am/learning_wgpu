@@ -56,13 +56,13 @@ impl Uniforms {
         }
     }
 
-    fn update_view_proj(&mut self, camera: &Camera) {
+    fn update_view_proj(&mut self, camera: &Camera, projection: &Projection) {
         // We don't specifically need homogeneous coordinates since we're just using
         // a vec3 in the shader. We're using Point3 for the camera.eye, and this is
         // the easiest way to convert to Vector4. We're using Vector4 because of
         // the uniforms 16 byte spacing requirement
-        self.view_position = camera.eye.to_homogeneous().into();
-        self.view_proj = camera.build_view_projection_matrix().into();
+        self.view_position = camera.position.to_homogeneous().into();
+        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into()
     }
 }
 
@@ -137,8 +137,9 @@ struct State {
     uniforms: Uniforms,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    camera: Camera,
-    camera_controller: CameraController,
+    camera: Camera,                      // UPDATED!
+    projection: Projection,              // NEW!
+    camera_controller: CameraController, // UPDATED!
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     depth_texture: Texture,
@@ -150,6 +151,7 @@ struct State {
     light_preview_render_pipeline: wgpu::RenderPipeline,
     depth_preview_render_pipeline: wgpu::RenderPipeline,
     rendering_mode: u32,
+    mouse_pressed: bool,
 }
 
 impl State {
@@ -206,6 +208,25 @@ impl State {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStage::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler {
+                            comparison: false,
+                            filtering: true,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStage::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: wgpu::ShaderStage::FRAGMENT,
                         ty: wgpu::BindingType::Sampler {
                             comparison: false,
@@ -337,22 +358,13 @@ impl State {
             label: Some("depth_bind_group"),
         });
 
-        let camera = Camera {
-            // position the camera one unit up and 2 units back
-            // +z is out of the screen
-            eye: (0.0, 1.0, 2.0).into(),
-            // have it look at the origin
-            target: (0.0, 0.0, 0.0).into(),
-            // which way is "up"
-            up: cgmath::Vector3::unit_y(),
-            aspect: sc_desc.width as f32 / sc_desc.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
+        let camera = Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let projection =
+            Projection::new(sc_desc.width, sc_desc.height, cgmath::Deg(45.0), 0.1, 100.0);
+        let camera_controller = CameraController::new(4.0, 0.4);
 
         let mut uniforms = Uniforms::new();
-        uniforms.update_view_proj(&camera);
+        uniforms.update_view_proj(&camera, &projection);
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
@@ -368,7 +380,6 @@ impl State {
             }],
             label: Some("uniform_bind_group"),
         });
-        let camera_controller = CameraController::new(0.2);
 
         const SPACE_BETWEEN: f32 = 3.0;
         let instances = (0..NUM_INSTANCES_PER_ROW)
@@ -449,10 +460,11 @@ impl State {
             },
             mouse_in_window: false,
             camera,
+            projection,
+            camera_controller,
             uniform_bind_group,
             uniforms,
             uniform_buffer,
-            camera_controller,
             instances,
             instance_buffer,
             depth_texture,
@@ -465,6 +477,7 @@ impl State {
             light_preview_render_pipeline,
             depth_preview_render_pipeline,
             rendering_mode: RenderingMode::Default as u32 | RenderingMode::LightPreview as u32,
+            mouse_pressed: false,
         }
     }
 
@@ -472,61 +485,59 @@ impl State {
         self.size = new_size;
         self.sc_desc.width = new_size.width;
         self.sc_desc.height = new_size.height;
+        self.projection.resize(new_size.width, new_size.height);
         self.swap_chain = self.device.create_swap_chain(&self.surface, &self.sc_desc);
         self.depth_texture =
             texture::Texture::create_depth_texture(&self.device, &self.sc_desc, "depth_texture");
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        if !self.camera_controller.process_events(event) {
-            match event {
-                WindowEvent::CursorEntered { .. } => {
-                    self.mouse_in_window = true;
+    fn input(&mut self, event: &DeviceEvent) -> bool {
+        match event {
+            DeviceEvent::Key(KeyboardInput {
+                virtual_keycode: Some(key),
+                state,
+                ..
+            }) => {
+                if self.camera_controller.process_keyboard(*key, *state) {
                     true
-                }
-                WindowEvent::CursorLeft { .. } => {
-                    self.mouse_in_window = false;
-                    true
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    if self.mouse_in_window {
-                        self.clear_color = wgpu::Color {
-                            r: position.x / self.size.width as f64,
-                            g: position.y / self.size.height as f64,
-                            b: 0.3,
-                            a: 1.0,
-                        };
-                        /*  println!(
-                            "mouse moved: x: {} y: {} color: {:?} size: {:?}",
-                            position.x, position.y, self.clear_color, self.size
-                        ); */
+                } else {
+                    match (state, key) {
+                        (ElementState::Pressed, VirtualKeyCode::Space) => {
+                            self.rendering_mode = self.rendering_mode
+                                ^ (RenderingMode::DepthPreview as u32
+                                    | RenderingMode::LightPreview as u32);
+                            println!("rendering mode: {}", self.rendering_mode);
+                            true
+                        }
+                        _ => false,
                     }
-                    true
                 }
-                WindowEvent::KeyboardInput { input, .. } => match input {
-                    KeyboardInput {
-                        state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::Space),
-                        ..
-                    } => {
-                        self.rendering_mode = self.rendering_mode
-                            ^ (RenderingMode::DepthPreview as u32
-                                | RenderingMode::LightPreview as u32);
-                        println!("rendering mode: {}", self.rendering_mode);
-                        true
-                    }
-                    _ => false,
-                },
-                _ => false,
             }
-        } else {
-            true
+            DeviceEvent::MouseWheel { delta, .. } => {
+                self.camera_controller.process_scroll(delta);
+                true
+            }
+            DeviceEvent::Button {
+                button: 1, // Left Mouse Button
+                state,
+            } => {
+                self.mouse_pressed = *state == ElementState::Pressed;
+                true
+            }
+            DeviceEvent::MouseMotion { delta } => {
+                if self.mouse_pressed {
+                    self.camera_controller.process_mouse(delta.0, delta.1);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
-    fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
-        self.uniforms.update_view_proj(&self.camera);
+    fn update(&mut self, dt: std::time::Duration) {
+        self.camera_controller.update_camera(&mut self.camera, dt);
+        self.uniforms
+            .update_view_proj(&self.camera, &self.projection);
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -548,10 +559,11 @@ impl State {
             ),
         );
         let old_position: cgmath::Vector3<_> = self.light.position.into();
-        self.light.position =
-            (cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_y(), cgmath::Deg(1.0))
-                * old_position)
-                .into();
+        self.light.position = (cgmath::Quaternion::from_axis_angle(
+            cgmath::Vector3::unit_y(),
+            cgmath::Deg(60.0 * dt.as_secs_f32()),
+        ) * old_position)
+            .into();
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[self.light]));
     }
@@ -634,12 +646,17 @@ fn main() {
 
     // Since main can't be async, we're going to need to block
     let mut state = block_on(State::new(&window));
+    let mut last_render_time = std::time::Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
         match event {
             Event::RedrawRequested(_) => {
-                state.update();
-                match state.render() {
+                let now = std::time::Instant::now();
+                let dt = now - last_render_time;
+                last_render_time = now;
+                state.update(dt);
+                                match state.render() {
                     Ok(_) => {}
                     // Recreate the swap_chain if lost
                     Err(wgpu::SwapChainError::Lost) => state.resize(state.size),
@@ -654,30 +671,65 @@ fn main() {
                 // request it.
                 window.request_redraw();
             }
+                        Event::DeviceEvent {
+                ref event,
+                .. // We're not using device_id currently
+            } => {
+                state.input(event);
+            }
             Event::WindowEvent {
                 ref event,
                 window_id,
             } if window_id == window.id() => {
-                if !state.input(event) {
-                    // UPDATED!
-                    match event {
-                        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                        WindowEvent::KeyboardInput { input, .. } => match input {
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            } => *control_flow = ControlFlow::Exit,
-                            _ => {}
-                        },
-                        WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
+                match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::KeyboardInput { input, .. } => match input {            
+                        KeyboardInput {
+                            state: ElementState::Pressed,
+                            virtual_keycode: Some(VirtualKeyCode::Back),
+                            ..
+                        } => {
+                            state.rendering_mode = state.rendering_mode
+                                ^ (RenderingMode::DepthPreview as u32
+                                    | RenderingMode::LightPreview as u32);
+                            println!("rendering mode: {}", state.rendering_mode);
                         }
-                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                            state.resize(**new_inner_size);
+                        KeyboardInput {
+                            state: ElementState::Pressed,
+                            virtual_keycode: Some(VirtualKeyCode::Escape),
+                            ..
+                        } => {
+                            *control_flow = ControlFlow::Exit;
                         }
                         _ => {}
+                    },
+                    WindowEvent::Resized(physical_size) => {
+                        state.resize(*physical_size);
                     }
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        state.resize(**new_inner_size);
+                    }
+                    WindowEvent::CursorEntered { .. } => {
+                        state.mouse_in_window = true;
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        state.mouse_in_window = false;
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        if state.mouse_in_window {
+                            state.clear_color = wgpu::Color {
+                                r: position.x / state.size.width as f64,
+                                g: position.y / state.size.height as f64,
+                                b: 0.3,
+                                a: 1.0,
+                            };
+                            /*  println!(
+                                "mouse moved: x: {} y: {} color: {:?} size: {:?}",
+                                position.x, position.y, self.clear_color, self.size
+                            ); */
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}

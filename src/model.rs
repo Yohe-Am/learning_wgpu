@@ -9,9 +9,14 @@ pub trait Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ModelVertex {
+    // Use cgmath to simplify the tangent, bitanget
+    // calculation. You can't add and subtract [f32; 3]
+    // without implementing such traits by yourself.
     position: [f32; 3],
     tex_coords: [f32; 2],
     normal: [f32; 3],
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
 }
 
 impl Vertex for ModelVertex {
@@ -35,6 +40,16 @@ impl Vertex for ModelVertex {
                     shader_location: 2,
                     format: wgpu::VertexFormat::Float3,
                 },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float3,
+                },
             ],
         }
     }
@@ -42,7 +57,48 @@ impl Vertex for ModelVertex {
 pub struct Material {
     pub name: String,
     pub diffuse_texture: texture::Texture,
+    pub normal_texture: texture::Texture,
     pub bind_group: wgpu::BindGroup,
+}
+
+impl Material {
+    pub fn new(
+        device: &wgpu::Device,
+        name: &str,
+        diffuse_texture: texture::Texture,
+        normal_texture: texture::Texture,
+        layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&normal_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&normal_texture.sampler),
+                },
+            ],
+            label: Some(name),
+        });
+
+        Self {
+            name: String::from(name),
+            diffuse_texture,
+            normal_texture,
+            bind_group,
+        }
+    }
 }
 
 pub struct Mesh {
@@ -74,28 +130,19 @@ impl Model {
         for mat in obj_materials {
             let diffuse_path = mat.diffuse_texture;
             let diffuse_texture =
-                texture::Texture::load(device, queue, containing_folder.join(diffuse_path))?;
+                texture::Texture::load(device, queue, containing_folder.join(diffuse_path), false)?;
 
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
-                    },
-                ],
-                label: None,
-            });
+            let normal_path = mat.normal_texture;
+            let normal_texture =
+                texture::Texture::load(device, queue, containing_folder.join(normal_path), true)?;
 
-            materials.push(Material {
-                name: mat.name,
+            materials.push(Material::new(
+                device,
+                &mat.name,
                 diffuse_texture,
-                bind_group,
-            });
+                normal_texture,
+                layout,
+            ));
         }
 
         let mut meshes = Vec::new();
@@ -114,7 +161,55 @@ impl Model {
                         m.mesh.normals[i * 3 + 1],
                         m.mesh.normals[i * 3 + 2],
                     ],
+                    tangent: [0.0; 3],
+                    bitangent: [0.0; 3],
                 });
+            }
+            let indices = &m.mesh.indices;
+
+            // Calculate tangents and bitangets. We're going to
+            // use the triangles, so we need to loop through the
+            // indices in chunks of 3
+            for c in indices.chunks(3) {
+                let v0 = vertices[c[0] as usize];
+                let v1 = vertices[c[1] as usize];
+                let v2 = vertices[c[2] as usize];
+
+                let pos0: cgmath::Vector3<_> = v0.position.into();
+                let pos1: cgmath::Vector3<_> = v1.position.into();
+                let pos2: cgmath::Vector3<_> = v2.position.into();
+
+                let uv0: cgmath::Vector2<_> = v0.tex_coords.into();
+                let uv1: cgmath::Vector2<_> = v1.tex_coords.into();
+                let uv2: cgmath::Vector2<_> = v2.tex_coords.into();
+
+                // Calculate the edges of the triangle
+                let delta_pos1 = pos1 - pos0;
+                let delta_pos2 = pos2 - pos0;
+
+                // This will give us a direction to calculate the
+                // tangent and bitangent
+                let delta_uv1 = uv1 - uv0;
+                let delta_uv2 = uv2 - uv0;
+
+                // Solving the following system of equations will
+                // give us the tangent and bitangent.
+                //     delta_pos1 = delta_uv1.x * T + delta_u.y * B
+                //     delta_pos2 = delta_uv2.x * T + delta_uv2.y * B
+                // Luckily, the place I found this equation provided
+                // the solution!
+                let r = 1.0 / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
+                let tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
+                let bitangent = (delta_pos2 * delta_uv1.x - delta_pos1 * delta_uv2.x) * r;
+
+                // We'll use the same tangent/bitangent for each vertex in the triangle
+                vertices[c[0] as usize].tangent = tangent.into();
+                vertices[c[1] as usize].tangent = tangent.into();
+                vertices[c[2] as usize].tangent = tangent.into();
+
+                vertices[c[0] as usize].bitangent = bitangent.into();
+                vertices[c[1] as usize].bitangent = bitangent.into();
+                vertices[c[2] as usize].bitangent = bitangent.into();
             }
 
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
